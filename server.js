@@ -28,59 +28,184 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ─── Shared Claude caller (uses Node built-in https) ─────────────────────────
-function callClaude(prompt) {
+// ─── Generic HTTPS request helper ────────────────────────────────────────────
+function httpsRequest(options, body = null) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1500,
-      messages: [{ role: 'user', content: prompt }],
-    });
-
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-    };
-
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
         try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) return reject(new Error(parsed.error.message));
-          const text = (parsed.content || [])
-            .filter(b => b.type === 'text')
-            .map(b => b.text)
-            .join('');
-          resolve(text);
+          resolve({ status: res.statusCode, body: JSON.parse(data) });
         } catch (e) {
-          reject(new Error('Failed to parse Anthropic response'));
+          resolve({ status: res.statusCode, body: data });
         }
       });
     });
-
     req.on('error', reject);
-    req.setTimeout(60000, () => {
-      req.destroy();
-      reject(new Error('Request timed out after 60s'));
-    });
-
-    req.write(body);
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('Request timed out')); });
+    if (body) req.write(body);
     req.end();
   });
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// ─── Shared Claude caller ─────────────────────────────────────────────────────
+function callClaude(prompt) {
+  const body = JSON.stringify({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1500,
+    messages: [{ role: 'user', content: prompt }],
+  });
 
-// Gap Analysis
+  return httpsRequest({
+    hostname: 'api.anthropic.com',
+    path: '/v1/messages',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+  }, body).then(({ body: parsed }) => {
+    if (parsed.error) throw new Error(parsed.error.message);
+    return (parsed.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  });
+}
+
+// ─── GitHub helpers ───────────────────────────────────────────────────────────
+function githubRequest(path, method = 'GET', body = null) {
+  const repo    = process.env.GITHUB_REPO;
+  const token   = process.env.GITHUB_TOKEN;
+  const payload = body ? JSON.stringify(body) : null;
+
+  return httpsRequest({
+    hostname: 'api.github.com',
+    path: `/repos/${repo}/${path}`,
+    method,
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'user-story-analyzer',
+      'Content-Type': 'application/json',
+      ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
+    },
+  }, payload);
+}
+
+// ─── GitHub: Fetch issue ──────────────────────────────────────────────────────
+app.post('/api/github/fetch-issue', requireSecret, async (req, res) => {
+  const { issueNumber } = req.body;
+  if (!issueNumber) return res.status(400).json({ error: 'issueNumber is required.' });
+
+  try {
+    const { status, body } = await githubRequest(`issues/${issueNumber}`);
+    if (status !== 200) return res.status(status).json({ error: body.message || 'GitHub error' });
+
+    res.json({
+      number:    body.number,
+      title:     body.title,
+      body:      body.body || '',
+      url:       body.html_url,
+      state:     body.state,
+      labels:    (body.labels || []).map(l => l.name),
+      createdAt: body.created_at,
+    });
+  } catch (err) {
+    console.error('[/api/github/fetch-issue]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GitHub: Push results as comment ─────────────────────────────────────────
+app.post('/api/github/push-results', requireSecret, async (req, res) => {
+  const { issueNumber, gaps, acceptanceCriteria, personas, documentation } = req.body;
+  if (!issueNumber) return res.status(400).json({ error: 'issueNumber is required.' });
+
+  try {
+    // Build a rich markdown comment
+    const severityEmoji = { high: '🔴', medium: '🟡', low: '🔵' };
+
+    const gapsSection = (gaps || []).map(g =>
+      `${severityEmoji[g.severity] || '⚪'} **${g.severity.toUpperCase()} — ${g.title}**\n${g.detail}`
+    ).join('\n\n');
+
+    const criteriaSection = (acceptanceCriteria || []).map(c => `- [ ] ${c}`).join('\n');
+
+    const personasSection = (personas || []).map(p =>
+      `- **${p.name}**: ${p.concern}`
+    ).join('\n');
+
+    const docSection = documentation ? `
+### 📄 Feature Overview
+**${documentation.feature_name || 'Feature'}**
+
+${documentation.overview || ''}
+
+**Problem Statement:** ${documentation.problem_statement || ''}
+
+**In Scope:** ${(documentation.scope?.in_scope || []).join(', ')}
+
+**Out of Scope:** ${(documentation.scope?.out_of_scope || []).join(', ')}
+
+**Open Questions:**
+${(documentation.open_questions || []).map((q, i) => `${i + 1}. ${q}`).join('\n')}
+` : '';
+
+    const comment = `## 🤖 AI Analysis — User Story Analyzer
+
+---
+
+### 🔍 Gap Analysis
+${gapsSection || '_No gaps identified._'}
+
+---
+
+### ✅ Suggested Acceptance Criteria
+${criteriaSection || '_No criteria suggested._'}
+
+---
+
+### 👥 Additional Personas to Consider
+${personasSection || '_No additional personas identified._'}
+
+---
+${docSection}
+
+---
+_Generated by [User Story Analyzer](https://mrunalmoghe84.github.io/user-story-analyzer)_`;
+
+    const { status, body } = await githubRequest(`issues/${issueNumber}/comments`, 'POST', { body: comment });
+
+    if (status !== 201) return res.status(status).json({ error: body.message || 'Failed to post comment' });
+
+    res.json({ success: true, commentUrl: body.html_url });
+  } catch (err) {
+    console.error('[/api/github/push-results]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GitHub: List open issues ─────────────────────────────────────────────────
+app.get('/api/github/issues', requireSecret, async (req, res) => {
+  try {
+    const { status, body } = await githubRequest('issues?state=open&per_page=20');
+    if (status !== 200) return res.status(status).json({ error: body.message || 'GitHub error' });
+
+    res.json(body.map(i => ({
+      number: i.number,
+      title:  i.title,
+      state:  i.state,
+      url:    i.html_url,
+    })));
+  } catch (err) {
+    console.error('[/api/github/issues]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Existing analysis routes ─────────────────────────────────────────────────
+
 app.post('/api/gaps', requireSecret, async (req, res) => {
   const { businessContext, userStory } = req.body;
   if (!businessContext || !userStory)
@@ -115,7 +240,6 @@ Cover 4–7 gaps across: missing error handling, edge cases, security/auth, perf
   }
 });
 
-// Prototype
 app.post('/api/prototype', requireSecret, async (req, res) => {
   const { businessContext, userStory } = req.body;
   if (!businessContext || !userStory)
@@ -143,7 +267,6 @@ Rules:
   }
 });
 
-// Documentation
 app.post('/api/documentation', requireSecret, async (req, res) => {
   const { businessContext, userStory } = req.body;
   if (!businessContext || !userStory)
