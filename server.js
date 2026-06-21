@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const cors    = require('cors');
-const fetch   = require('node-fetch');
+const https   = require('https');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(express.json());
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || '*',   // set to your GitHub Pages URL in production
+  origin: process.env.ALLOWED_ORIGIN || '*',
   methods: ['GET', 'POST'],
 }));
 
@@ -28,46 +28,54 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ─── Shared Claude caller ─────────────────────────────────────────────────────
-async function callClaude(prompt) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 55000); // 55 second timeout
+// ─── Shared Claude caller (uses Node built-in https) ─────────────────────────
+function callClaude(prompt) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1500,
+      messages: [{ role: 'user', content: prompt }],
+    });
 
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
         'x-api-key': process.env.ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1500,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-      signal: controller.signal,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) return reject(new Error(parsed.error.message));
+          const text = (parsed.content || [])
+            .filter(b => b.type === 'text')
+            .map(b => b.text)
+            .join('');
+          resolve(text);
+        } catch (e) {
+          reject(new Error('Failed to parse Anthropic response'));
+        }
+      });
     });
 
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(err?.error?.message || `Anthropic API error ${response.status}`);
-    }
+    req.on('error', reject);
+    req.setTimeout(60000, () => {
+      req.destroy();
+      reject(new Error('Request timed out after 60s'));
+    });
 
-    const data = await response.json();
-    return data.content.filter(b => b.type === 'text').map(b => b.text).join('');
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Anthropic API error ${response.status}`);
-  }
-
-  const data = await response.json();
-  return data.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    req.write(body);
+    req.end();
+  });
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -75,9 +83,8 @@ async function callClaude(prompt) {
 // Gap Analysis
 app.post('/api/gaps', requireSecret, async (req, res) => {
   const { businessContext, userStory } = req.body;
-  if (!businessContext || !userStory) {
+  if (!businessContext || !userStory)
     return res.status(400).json({ error: 'businessContext and userStory are required.' });
-  }
 
   try {
     const prompt = `You are a senior product analyst. Analyze this user story for gaps, risks, and missing details.
@@ -111,9 +118,8 @@ Cover 4–7 gaps across: missing error handling, edge cases, security/auth, perf
 // Prototype
 app.post('/api/prototype', requireSecret, async (req, res) => {
   const { businessContext, userStory } = req.body;
-  if (!businessContext || !userStory) {
+  if (!businessContext || !userStory)
     return res.status(400).json({ error: 'businessContext and userStory are required.' });
-  }
 
   try {
     const prompt = `You are a UX designer. Generate a clean semantic HTML snippet for a realistic UI prototype based on this user story.
@@ -140,9 +146,8 @@ Rules:
 // Documentation
 app.post('/api/documentation', requireSecret, async (req, res) => {
   const { businessContext, userStory } = req.body;
-  if (!businessContext || !userStory) {
+  if (!businessContext || !userStory)
     return res.status(400).json({ error: 'businessContext and userStory are required.' });
-  }
 
   try {
     const prompt = `You are a technical writer. Create structured documentation for this user story.
